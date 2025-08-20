@@ -1,41 +1,42 @@
 """
-FIMD Global (multi-output + work-hours) con muestras FORZADAS en torno a pulsos de N
------------------------------------------------------------------------------------
-Beaudeau et al. (2023) – Modelo 1
-
-Qué agrega respecto al GLOBAL anterior:
-1) Para CADA fermentación, si un pulso de N cae en horario hábil (L–V, 08–17),
-   se fuerza: (a) **una muestra en el momento del pulso** (redondeada al slot
-   de muestreo más cercano permitido) y (b) **≥1 muestra dentro de [tN, tN+2 h]**.
-   Ambas cuentan para el tope de **2 muestras/día/exp**.
-2) Si forzar ambas excede el tope diario, se prioriza la muestra **en el pulso**
-   y se intenta reubicar la post-pulso en el siguiente día hábil cercano.
-3) Selección GLOBAL greedy (D-óptimo rank-m) con presupuesto K_total
-   repartido entre todas las fermentaciones elegidas.
-4) Exporta un plan en Excel con resumen de diseños y calendario de muestreo.
+FIMD Global (multi-output) con restricciones operacionales en horario hábil
++ muestreo ampliado y forzados alrededor de pulsos
+--------------------------------------------------------------------------
+Basado en la versión v4 que integra muestreo en horario hábil y forzados en pulsos.
+Cambios clave en esta v5:
+  1) **NUEVA restricción operativa dura**: los **cambios de set-point** (t12, t23) y los
+     **pulsos de N (tN1, tN2)** deben caer en **horario hábil L–V 08:00–17:00**.
+     - Se garantiza desde la **generación de candidatos** y, opcionalmente,
+       con un **reparador** que ajusta al **siguiente slot hábil** (flag configurable).
+  2) **Muestreo ampliado**: por defecto **K_per_exp = 18** (antes 12) manteniendo
+     el tope de **2 muestras/día/fermentación** en horario hábil.
+  3) Se conservan las reglas de muestreo **forzado en pulsos** (muestra en el pulso
+     y ≥1 muestra en [tN, tN+2 h] si es hábil), respetando el tope diario.
+  4) Exporta Excel con resumen y vista calendario.
 
 Notas:
-- tauN (τ) es la **duración (h)** del pulso rectangular de N. El modelo reparte
-  la dosis (mg/L) en un caudal constante durante τ horas (term source en dN/dt).
-  Físicamente aproxima una adición con mezcla distribuida en τ (evita delta-impulso).
+- τ (tauN) es la **duración (h)** del pulso rectangular de N; la dosis mg/L se reparte
+  a caudal constante durante τ (término fuente en dN/dt).
+- El mapeo a calendario asume **t=0 → Lunes 08:00**.
 
-Requisitos: numpy, scipy, xlsxwriter (a través de pandas.ExcelWriter)
+Requisitos: numpy, scipy, pandas
 """
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 import numpy as np
-from scipy.integrate import solve_ivp
 import numpy.linalg as npl
 import pandas as pd
+from scipy.integrate import solve_ivp
 
+# -------------------- índices de estado --------------------
 STATE_IDX = {"X":0, "S":1, "N":2, "E":3, "CO2":4, "Nintra":5, "NST":6, "A":7}
 
 # -------------------- Parámetros y configs --------------------
 @dataclass
 class BeaudeauModel1Params:
     alpha_k1: float = 0.0287
-    beta_k1: float  = 0.3
+    beta_k1:  float = 0.3
     k2: float = 0.0386
     KS: float = 20.67
     KSI: float = 0.006299
@@ -82,8 +83,8 @@ class SimulationConfig:
     stop_on_s_exhausted: bool = False
     # Calendario operativo
     start_weekday: int = 0   # 0=Lunes
-    start_hour: int = 8      # 08:00
-    end_hour_exclusive: int = 17  # valido 08..16
+    start_hour: int = 8      # 08:00 → t=0
+    end_hour_exclusive: int = 17  # válido 08..16:59
 
 @dataclass
 class MeasurementModel:
@@ -99,16 +100,20 @@ class MeasurementModel:
 class FIMDGlobalConfig:
     n_candidates: int = 60
     n_select: int = 21
-    K_per_exp: int = 12
+    K_per_exp: int = 18          # ← ampliado
     daily_cap: int = 2
     seed: int = 42
     K_total: int | None = None
-    feeds_in_workhours: bool = True
+    # NUEVAS banderas
+    feeds_in_workhours: bool = True        # pulsos tN1,tN2 en hábil
+    setpoints_in_workhours: bool = True    # t12,t23 en hábil
+    repair_ops_to_workhours: bool = True   # si algún tiempo no cae en hábil, ajustar al siguiente slot hábil
+    # Forzados en pulsos (muestreo)
     force_postpulse: bool = True
     force_at_pulse: bool = True
     verbose: bool = True
 
-# -------------------- Utilidades de calendario --------------------
+# -------------------- Utilidades calendario --------------------
 
 def compute_calendar_masks(t_eval: np.ndarray, sim: SimulationConfig) -> Tuple[np.ndarray, np.ndarray]:
     abs_hour = sim.start_hour + t_eval
@@ -126,6 +131,17 @@ def is_workhour(t: float, sim: SimulationConfig) -> bool:
     wd = (d + sim.start_weekday) % 7
     hod = abs_hour % 24.0
     return (wd <= 4) and (sim.start_hour <= hod < sim.end_hour_exclusive)
+
+
+def snap_to_next_workhour(t: float, sim: SimulationConfig) -> float:
+    """Empuja t al siguiente slot hábil (redondeo a hora entera)."""
+    tt = float(np.ceil(t))
+    # probar 7 días hacia adelante
+    for _ in range(7*24):
+        if is_workhour(tt, sim):
+            return tt
+        tt += 1.0
+    return t  # fallback improbable
 
 
 def map_time_to_calendar(t: float, sim: SimulationConfig) -> str:
@@ -209,6 +225,7 @@ def sensitivities_fd_multi(theta_names: List[str], p_nom: BeaudeauModel1Params,
     n_t = Y_nom.shape[0]
     m = 4; n_theta = len(theta_names)
     J = np.zeros((n_t, m, n_theta))
+    Y_nom_meas = measure_XSNE(Y_nom)
     for k, name in enumerate(theta_names):
         val = getattr(p_nom, name); h = rel_eps*max(abs(val),1e-6)
         p_plus  = BeaudeauModel1Params(**{**p_nom.__dict__, name: val + h})
@@ -216,6 +233,7 @@ def sensitivities_fd_multi(theta_names: List[str], p_nom: BeaudeauModel1Params,
         _, Yp = simulate(phi, p_plus,  sim, t_eval, use_event=False)
         _, Ym = simulate(phi, p_minus, sim, t_eval, use_event=False)
         J[:,:,k] = (measure_XSNE(Yp) - measure_XSNE(Ym)) / (2.0*h)
+    # seguridad ante NaN/Inf
     return np.nan_to_num(J, nan=0.0, posinf=0.0, neginf=0.0), t_eval
 
 # -------------------- Linalg robusto --------------------
@@ -257,28 +275,22 @@ def fim_from_selected(J_list: List[np.ndarray], Sigma_y: np.ndarray, idx_lists: 
             F += S.T @ Sinv @ S
     return F
 
-# -------------------- Reglas de forzado post-pulso --------------------
+# -------------------- Forzados alrededor de pulsos --------------------
 
 def forced_indices_for_experiment(t_eval: np.ndarray, phi: Design, sim: SimulationConfig,
                                   allowed_mask: np.ndarray, day_idx: np.ndarray,
                                   cfg: FIMDGlobalConfig) -> Tuple[np.ndarray, Dict[int, Dict[str,bool]]]:
-    """Devuelve índices de tiempos forzados y banderas por día: {day: {at_pulse, post_pulse}}."""
     forced: List[int] = []
     flags: Dict[int, Dict[str,bool]] = {}
 
     def nearest_allowed_index(t_target: float) -> int | None:
-        # Busca el slot más cercano en t_eval que esté permitido
         if t_target < t_eval[0] or t_target > t_eval[-1]:
             return None
-        # candidatos cercanos (redondeo a entero primero)
         cand = int(round(t_target))
         neigh = [cand, cand-1, cand+1]
         for tt in neigh:
-            if tt < 0 or tt >= len(t_eval):
-                continue
-            if allowed_mask[tt]:
+            if 0 <= tt < len(t_eval) and allowed_mask[tt]:
                 return tt
-        # fallback: el más cercano en norma con allowed
         idx_allowed = np.where(allowed_mask)[0]
         if idx_allowed.size==0: return None
         k = int(idx_allowed[np.argmin(np.abs(t_eval[idx_allowed] - t_target))])
@@ -302,10 +314,8 @@ def forced_indices_for_experiment(t_eval: np.ndarray, phi: Design, sim: Simulati
                     flags[d]["at_pulse"] = True
             if cfg.force_postpulse:
                 idx_win = post_window_indices(tN, window=2.0)
-                # evitar duplicar i_at si coincide
                 idx_win = [i for i in idx_win if i not in forced]
                 if idx_win:
-                    # el más cercano por encima de tN
                     i_pp = int(idx_win[0])
                     forced.append(i_pp)
                     d = int(day_idx[i_pp])
@@ -316,22 +326,15 @@ def forced_indices_for_experiment(t_eval: np.ndarray, phi: Design, sim: Simulati
 
 def enforce_daily_cap(pre_idx: np.ndarray, day_idx: np.ndarray, cap: int,
                       priority_mask: Dict[int, Dict[str,bool]]) -> np.ndarray:
-    """Si se excede el tope por día, prioriza at_pulse luego post_pulse.
-    priority_mask indica para cada día si un índice proviene del pulso/post.
-    """
     keep: List[int] = []
     per_day: Dict[int, List[int]] = {}
-    # construir listas por día con prioridad
     for i in sorted(pre_idx.tolist()):
         d = int(day_idx[i])
         per_day.setdefault(d, []).append(i)
     for d, idxs in per_day.items():
         if len(idxs) <= cap:
             keep.extend(idxs); continue
-        # dividir por tipo
-        at_list = []
-        post_list = []
-        others = []
+        at_list = []; post_list = []; others = []
         for i in idxs:
             tag = priority_mask.get(d, {"at_pulse": False, "post_pulse": False})
             if tag.get("at_pulse", False) and i in pre_idx:
@@ -340,7 +343,6 @@ def enforce_daily_cap(pre_idx: np.ndarray, day_idx: np.ndarray, cap: int,
                 post_list.append(i)
             else:
                 others.append(i)
-        # priorizar at_pulse, luego post, completar con others por cercanía a las 10–12h
         chosen = []
         for L in [at_list, post_list, others]:
             for i in L:
@@ -349,7 +351,7 @@ def enforce_daily_cap(pre_idx: np.ndarray, day_idx: np.ndarray, cap: int,
         keep.extend(chosen)
     return np.array(sorted(set(keep)), dtype=int)
 
-# -------------------- Greedy global con forzados --------------------
+# -------------------- Asignación global (greedy rank-m) --------------------
 
 def global_greedy_allocate_forced(J_list: List[np.ndarray], Sigma_y: np.ndarray,
                                   allowed_list: List[np.ndarray], day_list: List[np.ndarray],
@@ -359,7 +361,6 @@ def global_greedy_allocate_forced(J_list: List[np.ndarray], Sigma_y: np.ndarray,
     n_theta = J_list[0].shape[2]
     Sinv = npl.inv(Sigma_y)
 
-    # Incorporar forzados en pre_idx y aplicar cap por día
     idx_lists = []
     total_selected = 0
     for e in range(n_exp):
@@ -368,11 +369,9 @@ def global_greedy_allocate_forced(J_list: List[np.ndarray], Sigma_y: np.ndarray,
         idx_lists.append(pre)
         total_selected += pre.size
 
-    # Ainv desde F_pre
     F_pre = fim_from_selected(J_list, Sigma_y, idx_lists)
     Ainv = robust_inv_spd(F_pre + 1e-8*np.eye(n_theta))
 
-    # Pool restante
     remaining: List[Tuple[int,int]] = []
     for e in range(n_exp):
         allowed = allowed_list[e]
@@ -381,12 +380,10 @@ def global_greedy_allocate_forced(J_list: List[np.ndarray], Sigma_y: np.ndarray,
             if i in pre_set: continue
             remaining.append((e, int(i)))
 
-    # Greedy hasta K_target
     logdet_Sinv = chol_logdet(Sinv)
     while total_selected < K_target and remaining:
         best = None; best_gain = -np.inf
         for (e,i) in remaining:
-            # respetar cap por día
             d = int(day_list[e][i])
             used_today = np.sum(day_list[e][idx_lists[e]]==d)
             if used_today >= daily_cap: continue
@@ -403,7 +400,6 @@ def global_greedy_allocate_forced(J_list: List[np.ndarray], Sigma_y: np.ndarray,
         Ainv = Ainv - Ainv @ S.T @ Minv @ S @ Ainv
         idx_lists[e] = np.append(idx_lists[e], i)
         total_selected += 1
-        # depurar remaining (quitar i y slots del mismo día si cap lleno)
         new_remaining = []
         dsel = int(day_list[e][i])
         for (ee,ii) in remaining:
@@ -415,33 +411,76 @@ def global_greedy_allocate_forced(J_list: List[np.ndarray], Sigma_y: np.ndarray,
             new_remaining.append((ee,ii))
         remaining = new_remaining
 
-    # ordenar
     out = []
     for e in range(n_exp):
         arr = np.array(sorted(set(idx_lists[e].tolist())), dtype=int)
         out.append(arr)
     return out
 
-# -------------------- Candidatos --------------------
+# -------------------- Generación y reparación de candidatos --------------------
+
+def draw_time_workhour(rng: np.random.Generator, lo: float, hi: float, sim: SimulationConfig) -> float:
+    for _ in range(400):
+        t = rng.uniform(lo, hi)
+        if is_workhour(t, sim):
+            return t
+    # fallback: empujar al siguiente hábil
+    t = rng.uniform(lo, hi)
+    return snap_to_next_workhour(t, sim)
+
+
+def repair_design_operational(phi: Design, sim: SimulationConfig, cfg: FIMDGlobalConfig) -> Design:
+    """Ajusta t12,t23,tN1,tN2 al siguiente slot hábil si no lo son.
+       Mantiene separaciones mínimas: t23 ≥ max(t12+6, 24) y tN2 ≥ tN1+6.
+    """
+    T1,T2,T3 = phi.T1, phi.T2, phi.T3
+    t12, t23 = phi.t12, phi.t23
+    tN1, tN2 = phi.tN1, phi.tN2
+    if cfg.setpoints_in_workhours:
+        if not is_workhour(t12, sim):
+            t12 = snap_to_next_workhour(t12, sim)
+        min_t23 = max(t12 + 6.0, 24.0)
+        if t23 < min_t23: t23 = min_t23
+        if not is_workhour(t23, sim):
+            t23 = snap_to_next_workhour(t23, sim)
+    if cfg.feeds_in_workhours:
+        if not is_workhour(tN1, sim):
+            tN1 = snap_to_next_workhour(tN1, sim)
+        min_tN2 = max(tN1 + 6.0, 20.0)
+        if tN2 < min_tN2: tN2 = min_tN2
+        if not is_workhour(tN2, sim):
+            tN2 = snap_to_next_workhour(tN2, sim)
+    return Design(T1,T2,T3,t12,t23,phi.doseN1_mgL,tN1,phi.doseN2_mgL,tN2,phi.tauN)
+
 
 def sample_designs(n: int, rng: np.random.Generator, sim: SimulationConfig,
-                   feeds_in_workhours: bool = True) -> List[Design]:
+                   feeds_in_workhours: bool = True, setpoints_in_workhours: bool = True,
+                   repair_ops_to_workhours: bool = True) -> List[Design]:
     designs: List[Design] = []
     for _ in range(n):
         T1,T2,T3 = rng.uniform(16.0, 28.0, size=3)
-        t12 = rng.uniform(6.0, 48.0)
-        t23 = rng.uniform(max(t12+6.0, 24.0), 120.0)
-        def draw_time(lo, hi):
-            for _ in range(200):
-                t = rng.uniform(lo, hi)
-                if (not feeds_in_workhours) or is_workhour(t, sim):
-                    return t
-            return rng.uniform(lo, hi)
-        tN1 = draw_time(10.0, 120.0)
-        tN2 = draw_time(max(tN1+6.0, 20.0), 160.0)
+        # set-points en horario hábil
+        if setpoints_in_workhours:
+            t12 = draw_time_workhour(rng, 6.0, 48.0, sim)
+            t23 = draw_time_workhour(rng, max(t12+6.0, 24.0), 120.0, sim)
+        else:
+            t12 = rng.uniform(6.0, 48.0)
+            t23 = rng.uniform(max(t12+6.0, 24.0), 120.0)
+        # pulsos en horario hábil
+        if feeds_in_workhours:
+            tN1 = draw_time_workhour(rng, 10.0, 120.0, sim)
+            tN2 = draw_time_workhour(rng, max(tN1+6.0, 20.0), 160.0, sim)
+        else:
+            tN1 = rng.uniform(10.0, 120.0)
+            tN2 = rng.uniform(max(tN1+6.0, 20.0), 160.0)
         dose1 = rng.uniform(0.0, 200.0); dose2 = rng.uniform(0.0, 200.0)
         tauN = rng.uniform(0.1, 0.5)
-        designs.append(Design(T1,T2,T3,t12,t23,dose1,tN1,dose2,tN2,tauN))
+        d = Design(T1,T2,T3,t12,t23,dose1,tN1,dose2,tN2,tauN)
+        if repair_ops_to_workhours:
+            d = repair_design_operational(d, sim, FIMDGlobalConfig(setpoints_in_workhours=setpoints_in_workhours,
+                                                                    feeds_in_workhours=feeds_in_workhours,
+                                                                    repair_ops_to_workhours=repair_ops_to_workhours))
+        designs.append(d)
     return designs
 
 # -------------------- FIMD Global (selección con forzados) --------------------
@@ -476,6 +515,9 @@ def fimd_global_forced(phi_list: List[Design], theta_names: List[str], p_nom: Be
 
         for j, phi in enumerate(phi_list):
             if j in chosen_idx: continue
+            # reparar por si acaso (si vino de fuera)
+            if cfg.repair_ops_to_workhours:
+                phi = repair_design_operational(phi, sim, cfg)
             # preparar listas para exps ya elegidos + candidato j
             exps = chosen_idx + [j]
             J_list: List[np.ndarray] = []
@@ -490,7 +532,6 @@ def fimd_global_forced(phi_list: List[Design], theta_names: List[str], p_nom: Be
                     if e not in J_bank:
                         J_bank[e], t_bank[e] = sensitivities_fd_multi(theta_names, p_nom, phi_list[e], sim)
                         allowed_bank[e], day_bank[e] = compute_calendar_masks(t_bank[e], sim)
-                        # forzados para ese diseño
                         f_idx, f_flags = forced_indices_for_experiment(t_bank[e], phi_list[e], sim,
                                                                        allowed_bank[e], day_bank[e], cfg)
                         forced_bank[e] = f_idx; forced_flags_bank[e] = f_flags
@@ -498,11 +539,9 @@ def fimd_global_forced(phi_list: List[Design], theta_names: List[str], p_nom: Be
                     pre_idx_lists.append(idxsel_bank.get(e, np.array([],dtype=int)))
                     forced_lists.append(forced_bank[e])
                     forced_flags.append(forced_flags_bank[e])
-                # asignación global con forzados
                 alloc_lists = global_greedy_allocate_forced(J_list, meas.Sigma, allowed_list, day_list,
                                                             forced_lists, forced_flags, pre_idx_lists,
                                                             K_target, daily_cap=cfg.daily_cap)
-                # F total resultante
                 F_total = fim_from_selected(J_list, meas.Sigma, alloc_lists)
             except Exception as e:
                 if cfg.verbose:
@@ -517,20 +556,17 @@ def fimd_global_forced(phi_list: List[Design], theta_names: List[str], p_nom: Be
         if best_idx is None:
             raise RuntimeError("No se pudo seleccionar ningún experimento (restricciones muy estrictas).")
 
-        # aceptar mejor y fijar asignación
         chosen_idx.append(best_idx)
         if best_alloc_tmp is not None:
-            for exp_id in chosen_idx:  # los presentes en esta evaluación
+            for exp_id in chosen_idx:
                 if exp_id in best_alloc_tmp:
                     idxsel_bank[exp_id] = np.array(sorted(set(best_alloc_tmp[exp_id].tolist())), dtype=int)
-        # actualizar F_accum
         F_accum = fim_from_selected([J_bank[e] for e in chosen_idx], meas.Sigma,
                                     [idxsel_bank[e] for e in chosen_idx])
         if cfg.verbose:
             counts = {e: len(idxsel_bank[e]) for e in chosen_idx}
             print(f"[GLOBAL FIMD FORCED] -> elegido idx={best_idx} | logdet={best_obj:.3f} | asignación={counts}")
 
-    # construir tiempos elegidos
     chosen_times = [ t_bank[e][idxsel_bank[e]] if len(idxsel_bank[e]) else np.array([]) for e in chosen_idx ]
     return chosen_idx, F_accum, chosen_times, t_bank, idxsel_bank, forced_bank
 
@@ -549,35 +585,19 @@ if __name__ == "__main__":
         "alpha_k1", "beta_k1",
     ]
 
-    cfg = FIMDGlobalConfig(n_candidates=60, n_select=21, K_per_exp=12, daily_cap=2,
-                           seed=42, K_total=None, feeds_in_workhours=True,
-                           force_postpulse=True, force_at_pulse=True, verbose=True)
+    cfg = FIMDGlobalConfig(
+        n_candidates=60, n_select=21,
+        K_per_exp=18, daily_cap=2, seed=42, K_total=None,
+        feeds_in_workhours=True, setpoints_in_workhours=True, repair_ops_to_workhours=True,
+        force_postpulse=True, force_at_pulse=True, verbose=True
+    )
 
-    print(f"[MAIN] Generando {cfg.n_candidates} candidatos (feeds_in_workhours={cfg.feeds_in_workhours})…")
+    print(f"[MAIN] Generando {cfg.n_candidates} candidatos con t12/t23 y tN1/tN2 en horario hábil…")
     rng = np.random.default_rng(cfg.seed)
-
-    def sample_designs(n: int, rng: np.random.Generator, sim: SimulationConfig,
-                       feeds_in_workhours: bool = True) -> List[Design]:
-        designs: List[Design] = []
-        for _ in range(n):
-            T1, T2, T3 = rng.uniform(16.0, 28.0, size=3)
-            t12 = rng.uniform(6.0, 48.0)
-            t23 = rng.uniform(max(t12 + 6.0, 24.0), 120.0)
-            def draw_time(low, high):
-                for _ in range(200):
-                    t = rng.uniform(low, high)
-                    if (not feeds_in_workhours) or is_workhour(t, sim):
-                        return t
-                return rng.uniform(low, high)
-            tN1 = draw_time(10.0, 120.0)
-            tN2 = draw_time(max(tN1 + 6.0, 20.0), 160.0)
-            dose1 = rng.uniform(0.0, 200.0)
-            dose2 = rng.uniform(0.0, 200.0)
-            tauN = rng.uniform(0.1, 0.5)
-            designs.append(Design(T1,T2,T3,t12,t23,dose1,tN1,dose2,tN2,tauN))
-        return designs
-
-    candidates = sample_designs(cfg.n_candidates, rng, sim, feeds_in_workhours=cfg.feeds_in_workhours)
+    candidates = sample_designs(cfg.n_candidates, rng, sim,
+                                feeds_in_workhours=cfg.feeds_in_workhours,
+                                setpoints_in_workhours=cfg.setpoints_in_workhours,
+                                repair_ops_to_workhours=cfg.repair_ops_to_workhours)
 
     print(f"[MAIN] Seleccionando {cfg.n_select} diseños (GLOBAL+FORCED)…")
     chosen_idx, F_final, chosen_times, t_bank, idxsel_bank, forced_bank = fimd_global_forced(
@@ -588,31 +608,37 @@ if __name__ == "__main__":
     rows = []
     for rank, idx in enumerate(chosen_idx, start=1):
         d = candidates[idx]
-        selected_times = t_bank[idx][idxsel_bank[idx]] if len(idxsel_bank[idx]) else np.array([])
-        forced_times = t_bank[idx][forced_bank[idx]] if len(forced_bank[idx]) else np.array([])
-        cal_sel = ", ".join(map(lambda t: map_time_to_calendar(float(t), sim), selected_times[:10]))
-        cal_for = ", ".join(map(lambda t: map_time_to_calendar(float(t), sim), forced_times))
+        sel = t_bank[idx][idxsel_bank[idx]] if len(idxsel_bank[idx]) else np.array([])
+        forced = t_bank[idx][forced_bank[idx]] if len(forced_bank[idx]) else np.array([])
+        cal_sel = ", ".join(map(lambda t: map_time_to_calendar(float(t), sim), sel[:12]))
+        cal_for = ", ".join(map(lambda t: map_time_to_calendar(float(t), sim), forced))
+        ops_cal = ", ".join([
+            f"t12→{map_time_to_calendar(d.t12, sim)}",
+            f"t23→{map_time_to_calendar(d.t23, sim)}",
+            f"N1@{map_time_to_calendar(d.tN1, sim)}",
+            f"N2@{map_time_to_calendar(d.tN2, sim)}",
+        ])
         rows.append({
             "rank": rank, "idx": idx,
             "T1": d.T1, "T2": d.T2, "T3": d.T3, "t12_h": d.t12, "t23_h": d.t23,
             "N1_mgL": d.doseN1_mgL, "tN1_h": d.tN1, "N2_mgL": d.doseN2_mgL, "tN2_h": d.tN2,
             "tau_h": d.tauN,
-            "n_times": int(selected_times.size),
-            "times_h": list(map(float, selected_times)),
-            "forced_times_h": list(map(float, forced_times)),
+            "n_times": int(sel.size),
+            "times_h": list(map(float, sel)),
+            "forced_times_h": list(map(float, forced)),
             "times_calendar_preview": cal_sel,
             "forced_calendar": cal_for,
+            "ops_calendar": ops_cal,
         })
 
     df = pd.DataFrame(rows)
-    out_path = "FIMD_GLOBAL_forced_pulse_plan.xlsx"
+    out_path = "FIMD_GLOBAL_opsWorkHours_plusSampling_plan.xlsx"
     with pd.ExcelWriter(out_path, engine="xlsxwriter") as w:
         df.to_excel(w, index=False, sheet_name="plan")
-        # hoja compacta
-        cols = ["rank","idx","T1","T2","T3","t12_h","t23_h","N1_mgL","tN1_h","N2_mgL","tN2_h","tau_h","n_times","times_calendar_preview","forced_calendar"]
+        cols = ["rank","idx","T1","T2","T3","t12_h","t23_h","N1_mgL","tN1_h","N2_mgL","tN2_h","tau_h","n_times","times_calendar_preview","forced_calendar","ops_calendar"]
         df[cols].to_excel(w, index=False, sheet_name="compact")
 
     sign, logdet = npl.slogdet(F_final + 1e-12*np.eye(len(theta_names)))
     print(f"\n[RESULT] log det(FIM acumulada) = {logdet:.3f}")
     print(f"[FILES] Exportado plan: {out_path}")
-    print("Nota sobre τ (tauN): duración (h) del pulso rectangular de N; la dosis mg/L se reparte a caudal constante durante τ, lo que modela mezcla/disp pers. corta y evita discontinuidad delta.")
+    print("Restricción operativa: t12,t23,tN1,tN2 ∈ horario hábil (L–V 08–17). Muestreo ampliado: K_per_exp=18, 2/día.")
